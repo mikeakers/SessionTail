@@ -439,6 +439,324 @@ struct EventRendererTests {
 }
 
 
+// MARK: - SessionDiscovery Listing Tests
+
+@Suite("SessionDiscovery Listing")
+struct SessionDiscoveryListingTests {
+
+    /// Creates a temporary sessions directory containing a `sessions.json` and any specified `.jsonl` stubs.
+    private func makeSessionsDir(
+        entries: [(key: String, sessionId: String, updatedAt: Int)],
+        presentSessionIds: Set<String>
+    ) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_sessions_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        // Write sessions.json
+        var jsonEntries: [String] = []
+        for entry in entries {
+            jsonEntries.append("""
+                "\(entry.key)": {"sessionId": "\(entry.sessionId)", "updatedAt": \(entry.updatedAt)}
+                """)
+        }
+        let json = "{\n" + jsonEntries.joined(separator: ",\n") + "\n}"
+        try json.data(using: .utf8)!.write(to: dir.appendingPathComponent("sessions.json"))
+
+        // Write stub .jsonl files for sessions that should "exist"
+        for sessionId in presentSessionIds {
+            let stub = dir.appendingPathComponent("\(sessionId).jsonl")
+            try "{}".data(using: .utf8)!.write(to: stub)
+        }
+
+        return dir
+    }
+
+    @Test func sortsByUpdatedAtDescending() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:a", sessionId: "aaaa0001", updatedAt: 100),
+                (key: "agent:main:b", sessionId: "bbbb0002", updatedAt: 300),
+                (key: "agent:main:c", sessionId: "cccc0003", updatedAt: 200),
+            ],
+            presentSessionIds: ["aaaa0001", "bbbb0002", "cccc0003"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions()
+
+        #expect(listings.count == 3)
+        #expect(listings[0].entry.sessionId == "bbbb0002")
+        #expect(listings[1].entry.sessionId == "cccc0003")
+        #expect(listings[2].entry.sessionId == "aaaa0001")
+    }
+
+    @Test func marksCurrentSession() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:a", sessionId: "aaaa0001", updatedAt: 100),
+                (key: "agent:main:b", sessionId: "bbbb0002", updatedAt: 300),
+            ],
+            presentSessionIds: ["aaaa0001", "bbbb0002"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions()
+
+        let current = listings.filter(\.isCurrent)
+        #expect(current.count == 1)
+        #expect(current[0].entry.sessionId == "bbbb0002")
+        #expect(listings.first(where: { $0.entry.sessionId == "aaaa0001" })?.isCurrent == false)
+    }
+
+    @Test func excludesDeletedByDefault() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:live", sessionId: "live0001", updatedAt: 300),
+                (key: "agent:main:gone", sessionId: "gone0002", updatedAt: 100),
+            ],
+            presentSessionIds: ["live0001"] // gone0002 has no .jsonl file
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions(includeDeleted: false)
+
+        #expect(listings.count == 1)
+        #expect(listings[0].entry.sessionId == "live0001")
+    }
+
+    @Test func includesDeletedWhenFlagSet() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:live", sessionId: "live0001", updatedAt: 300),
+                (key: "agent:main:gone", sessionId: "gone0002", updatedAt: 100),
+            ],
+            presentSessionIds: ["live0001"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions(includeDeleted: true)
+
+        #expect(listings.count == 2)
+        let gone = listings.first(where: { $0.entry.sessionId == "gone0002" })
+        #expect(gone != nil)
+        #expect(gone!.fileExists == false)
+        #expect(gone!.isCurrent == false)
+    }
+
+    @Test func currentIsLiveSessionEvenIfDeletedHasHigherTimestamp() throws {
+        // The deleted session has a higher updatedAt, but isCurrent should pick the highest *live* one
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:live", sessionId: "live0001", updatedAt: 200),
+                (key: "agent:main:gone", sessionId: "gone0002", updatedAt: 999),
+            ],
+            presentSessionIds: ["live0001"] // gone0002 file is missing
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions(includeDeleted: true)
+
+        let current = listings.filter(\.isCurrent)
+        #expect(current.count == 1)
+        #expect(current[0].entry.sessionId == "live0001")
+    }
+
+    @Test func emptyIndexReturnsEmptyList() throws {
+        let dir = try makeSessionsDir(entries: [], presentSessionIds: [])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions()
+        #expect(listings.isEmpty)
+    }
+
+    @Test func throwsWhenSessionsJsonMissing() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("no_such_dir_\(UUID().uuidString)")
+        // Do NOT create the directory — sessions.json won't exist
+        let discovery = SessionDiscovery(path: dir.path)
+        #expect(throws: SessionDiscoveryError.self) {
+            _ = try discovery.allSessions()
+        }
+    }
+}
+
+
+// MARK: - SessionDiscovery Resolve Tests
+
+@Suite("SessionDiscovery Resolve")
+struct SessionDiscoveryResolveTests {
+
+    /// Creates a temporary sessions directory with a `sessions.json` and optional stub `.jsonl` files.
+    private func makeSessionsDir(
+        entries: [(key: String, sessionId: String, updatedAt: Int)],
+        presentSessionIds: Set<String>
+    ) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_resolve_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        var jsonEntries: [String] = []
+        for entry in entries {
+            jsonEntries.append("""
+                "\(entry.key)": {"sessionId": "\(entry.sessionId)", "updatedAt": \(entry.updatedAt)}
+                """)
+        }
+        let json = "{\n" + jsonEntries.joined(separator: ",\n") + "\n}"
+        try json.data(using: .utf8)!.write(to: dir.appendingPathComponent("sessions.json"))
+
+        for sessionId in presentSessionIds {
+            try "{}".data(using: .utf8)!.write(to: dir.appendingPathComponent("\(sessionId).jsonl"))
+        }
+
+        return dir
+    }
+
+    @Test func resolvesBySessionKey() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+                (key: "agent:main:other", sessionId: "bbbb0002-0000-0000-0000-000000000000", updatedAt: 200),
+            ],
+            presentSessionIds: ["aaaa0001-0000-0000-0000-000000000000", "bbbb0002-0000-0000-0000-000000000000"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let resolved = try discovery.resolveSession(byId: "agent:main:main")
+
+        #expect(resolved.sessionKey == "agent:main:main")
+        #expect(resolved.sessionId == "aaaa0001-0000-0000-0000-000000000000")
+    }
+
+    @Test func resolvesByUUIDFallback() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+            ],
+            presentSessionIds: ["aaaa0001-0000-0000-0000-000000000000"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let resolved = try discovery.resolveSession(byId: "aaaa0001-0000-0000-0000-000000000000")
+
+        #expect(resolved.sessionKey == "agent:main:main")
+        #expect(resolved.sessionId == "aaaa0001-0000-0000-0000-000000000000")
+    }
+
+    @Test func sessionKeyTakesPriorityOverUUID() throws {
+        // A session whose key happens to equal another session's UUID — key match should win
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "cccc0003-0000-0000-0000-000000000000", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+                (key: "agent:main:other", sessionId: "cccc0003-0000-0000-0000-000000000000", updatedAt: 200),
+            ],
+            presentSessionIds: [
+                "aaaa0001-0000-0000-0000-000000000000",
+                "cccc0003-0000-0000-0000-000000000000",
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let resolved = try discovery.resolveSession(byId: "cccc0003-0000-0000-0000-000000000000")
+
+        // Should match by key, not UUID fallback
+        #expect(resolved.sessionKey == "cccc0003-0000-0000-0000-000000000000")
+        #expect(resolved.sessionId == "aaaa0001-0000-0000-0000-000000000000")
+    }
+
+    @Test func throwsSessionKeyNotFoundForUnknownId() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+            ],
+            presentSessionIds: ["aaaa0001-0000-0000-0000-000000000000"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        #expect(throws: SessionDiscoveryError.self) {
+            _ = try discovery.resolveSession(byId: "agent:main:nonexistent")
+        }
+    }
+
+    @Test func doesNotMatchPartialUUID() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+            ],
+            presentSessionIds: ["aaaa0001-0000-0000-0000-000000000000"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        #expect(throws: SessionDiscoveryError.self) {
+            _ = try discovery.resolveSession(byId: "aaaa0001")
+        }
+    }
+
+    @Test func throwsSessionFileNotFoundWhenJsonlMissing() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+            ],
+            presentSessionIds: [] // no .jsonl file written
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        #expect(throws: SessionDiscoveryError.self) {
+            _ = try discovery.resolveSession(byId: "agent:main:main")
+        }
+    }
+}
+
+
+// MARK: - relativeTime Tests
+
+@Suite("relativeTime")
+struct RelativeTimeTests {
+
+    @Test func justNow() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 30_000 // 30 seconds ago
+        #expect(relativeTime(fromUnixMs: ms) == "just now")
+    }
+
+    @Test func minutesAgo() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 5 * 60_000 // 5 minutes ago
+        #expect(relativeTime(fromUnixMs: ms) == "5 minutes ago")
+    }
+
+    @Test func oneMinuteAgo() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 90_000 // 90 seconds ago
+        #expect(relativeTime(fromUnixMs: ms) == "1 minute ago")
+    }
+
+    @Test func hoursAgo() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 3 * 3_600_000 // 3 hours ago
+        #expect(relativeTime(fromUnixMs: ms) == "3 hours ago")
+    }
+
+    @Test func daysAgo() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 2 * 86_400_000 // 2 days ago
+        #expect(relativeTime(fromUnixMs: ms) == "2 days ago")
+    }
+
+    @Test func weeksAgo() {
+        let ms = Int(Date().timeIntervalSince1970 * 1000) - 3 * 7 * 86_400_000 // 3 weeks ago
+        #expect(relativeTime(fromUnixMs: ms) == "3 weeks ago")
+    }
+}
+
+
 // MARK: - SessionIndex Tests
 
 @Suite("SessionIndex")
