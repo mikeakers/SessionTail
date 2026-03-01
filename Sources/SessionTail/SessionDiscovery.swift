@@ -58,8 +58,10 @@ struct SessionDiscovery: Sendable {
 
         var listings: [SessionListing] = []
         for item in sorted {
-            let jsonlFile = sessionsDirectory.appendingPathComponent("\(item.entry.sessionId).jsonl")
-            let exists = FileManager.default.fileExists(atPath: jsonlFile.path)
+            let resolvedFile = resolveJsonlFile(sessionId: item.entry.sessionId)
+            let exists = resolvedFile != nil
+            let filePath = resolvedFile
+                ?? sessionsDirectory.appendingPathComponent("\(item.entry.sessionId).jsonl")
 
             if !includeDeleted && !exists {
                 continue
@@ -68,7 +70,7 @@ struct SessionDiscovery: Sendable {
             listings.append(SessionListing(
                 key: item.key,
                 entry: item.entry,
-                filePath: jsonlFile,
+                filePath: filePath,
                 fileExists: exists,
                 isCurrent: item.entry.sessionId == currentSessionId
             ))
@@ -105,9 +107,9 @@ struct SessionDiscovery: Sendable {
             throw .sessionKeyNotFound(id: id)
         }
 
-        let jsonlFile = sessionsDirectory.appendingPathComponent("\(matchedEntry.sessionId).jsonl")
-        guard FileManager.default.fileExists(atPath: jsonlFile.path) else {
-            throw .sessionFileNotFound(sessionId: matchedEntry.sessionId, path: jsonlFile.path)
+        guard let jsonlFile = resolveJsonlFile(sessionId: matchedEntry.sessionId) else {
+            let expectedPath = sessionsDirectory.appendingPathComponent("\(matchedEntry.sessionId).jsonl").path
+            throw .sessionFileNotFound(sessionId: matchedEntry.sessionId, path: expectedPath)
         }
 
         return ResolvedSession(
@@ -117,6 +119,24 @@ struct SessionDiscovery: Sendable {
             model: matchedEntry.model,
             provider: matchedEntry.modelProvider
         )
+    }
+
+    /// Finds the JSONL file for a session ID, checking for the live path first, then a
+    /// `.deleted.<timestamp>` variant. Returns `nil` if neither exists on disk.
+    private func resolveJsonlFile(sessionId: String) -> URL? {
+        let live = sessionsDirectory.appendingPathComponent("\(sessionId).jsonl")
+        if FileManager.default.fileExists(atPath: live.path) {
+            return live
+        }
+
+        // Glob for a deleted variant: <sessionId>.jsonl.deleted.<timestamp>
+        let prefix = "\(sessionId).jsonl.deleted."
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: sessionsDirectory.path)) ?? []
+        if let match = contents.first(where: { $0.hasPrefix(prefix) }) {
+            return sessionsDirectory.appendingPathComponent(match)
+        }
+
+        return nil
     }
 
     /// Resolve the JSONL file path for the current (most recently updated) session.

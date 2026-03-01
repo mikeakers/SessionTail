@@ -444,10 +444,12 @@ struct EventRendererTests {
 @Suite("SessionDiscovery Listing")
 struct SessionDiscoveryListingTests {
 
-    /// Creates a temporary sessions directory containing a `sessions.json` and any specified `.jsonl` stubs.
+    /// Creates a temporary sessions directory containing a `sessions.json`, live `.jsonl` stubs,
+    /// and deleted `.jsonl.deleted.<timestamp>` stubs.
     private func makeSessionsDir(
         entries: [(key: String, sessionId: String, updatedAt: Int)],
-        presentSessionIds: Set<String>
+        presentSessionIds: Set<String>,
+        deletedSessionIds: Set<String> = []
     ) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test_sessions_\(UUID().uuidString)")
@@ -463,9 +465,15 @@ struct SessionDiscoveryListingTests {
         let json = "{\n" + jsonEntries.joined(separator: ",\n") + "\n}"
         try json.data(using: .utf8)!.write(to: dir.appendingPathComponent("sessions.json"))
 
-        // Write stub .jsonl files for sessions that should "exist"
+        // Write stub live .jsonl files
         for sessionId in presentSessionIds {
             let stub = dir.appendingPathComponent("\(sessionId).jsonl")
+            try "{}".data(using: .utf8)!.write(to: stub)
+        }
+
+        // Write stub deleted .jsonl.deleted.<timestamp> files
+        for sessionId in deletedSessionIds {
+            let stub = dir.appendingPathComponent("\(sessionId).jsonl.deleted.2026-01-01T00-00-00.000Z")
             try "{}".data(using: .utf8)!.write(to: stub)
         }
 
@@ -534,7 +542,8 @@ struct SessionDiscoveryListingTests {
                 (key: "agent:main:live", sessionId: "live0001", updatedAt: 300),
                 (key: "agent:main:gone", sessionId: "gone0002", updatedAt: 100),
             ],
-            presentSessionIds: ["live0001"]
+            presentSessionIds: ["live0001"],
+            deletedSessionIds: ["gone0002"]
         )
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -544,8 +553,31 @@ struct SessionDiscoveryListingTests {
         #expect(listings.count == 2)
         let gone = listings.first(where: { $0.entry.sessionId == "gone0002" })
         #expect(gone != nil)
-        #expect(gone!.fileExists == false)
+        #expect(gone!.fileExists == true)
+        #expect(gone!.filePath.lastPathComponent.contains(".deleted."))
         #expect(gone!.isCurrent == false)
+    }
+
+    @Test func includesEntryWithNoFileWhenAllFlagSet() throws {
+        // An entry with no file on disk at all (neither live nor deleted) is included with --all
+        // but fileExists is false so callers can distinguish it
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:live", sessionId: "live0001", updatedAt: 300),
+                (key: "agent:main:ghost", sessionId: "ghost0003", updatedAt: 100),
+            ],
+            presentSessionIds: ["live0001"]
+            // ghost0003 has no file at all
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let listings = try discovery.allSessions(includeDeleted: true)
+
+        #expect(listings.count == 2)
+        let ghost = listings.first(where: { $0.entry.sessionId == "ghost0003" })
+        #expect(ghost != nil)
+        #expect(ghost!.fileExists == false)
     }
 
     @Test func currentIsLiveSessionEvenIfDeletedHasHigherTimestamp() throws {
@@ -555,7 +587,8 @@ struct SessionDiscoveryListingTests {
                 (key: "agent:main:live", sessionId: "live0001", updatedAt: 200),
                 (key: "agent:main:gone", sessionId: "gone0002", updatedAt: 999),
             ],
-            presentSessionIds: ["live0001"] // gone0002 file is missing
+            presentSessionIds: ["live0001"],
+            deletedSessionIds: ["gone0002"]
         )
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -593,10 +626,12 @@ struct SessionDiscoveryListingTests {
 @Suite("SessionDiscovery Resolve")
 struct SessionDiscoveryResolveTests {
 
-    /// Creates a temporary sessions directory with a `sessions.json` and optional stub `.jsonl` files.
+    /// Creates a temporary sessions directory with a `sessions.json`, live `.jsonl` stubs,
+    /// and deleted `.jsonl.deleted.<timestamp>` stubs.
     private func makeSessionsDir(
         entries: [(key: String, sessionId: String, updatedAt: Int)],
-        presentSessionIds: Set<String>
+        presentSessionIds: Set<String>,
+        deletedSessionIds: Set<String> = []
     ) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("test_resolve_\(UUID().uuidString)")
@@ -613,6 +648,12 @@ struct SessionDiscoveryResolveTests {
 
         for sessionId in presentSessionIds {
             try "{}".data(using: .utf8)!.write(to: dir.appendingPathComponent("\(sessionId).jsonl"))
+        }
+
+        for sessionId in deletedSessionIds {
+            try "{}".data(using: .utf8)!.write(
+                to: dir.appendingPathComponent("\(sessionId).jsonl.deleted.2026-01-01T00-00-00.000Z")
+            )
         }
 
         return dir
@@ -703,12 +744,31 @@ struct SessionDiscoveryResolveTests {
         }
     }
 
-    @Test func throwsSessionFileNotFoundWhenJsonlMissing() throws {
+    @Test func resolvesByKeyForDeletedSession() throws {
+        let dir = try makeSessionsDir(
+            entries: [
+                (key: "agent:main:gone", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
+            ],
+            presentSessionIds: [],
+            deletedSessionIds: ["aaaa0001-0000-0000-0000-000000000000"]
+        )
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let discovery = SessionDiscovery(path: dir.path)
+        let resolved = try discovery.resolveSession(byId: "agent:main:gone")
+
+        #expect(resolved.sessionKey == "agent:main:gone")
+        #expect(resolved.sessionId == "aaaa0001-0000-0000-0000-000000000000")
+        #expect(resolved.filePath.lastPathComponent.contains(".deleted."))
+    }
+
+    @Test func throwsSessionFileNotFoundWhenNoFileExists() throws {
+        // Neither a live .jsonl nor a .jsonl.deleted.* file exists for this session
         let dir = try makeSessionsDir(
             entries: [
                 (key: "agent:main:main", sessionId: "aaaa0001-0000-0000-0000-000000000000", updatedAt: 100),
             ],
-            presentSessionIds: [] // no .jsonl file written
+            presentSessionIds: []
         )
         defer { try? FileManager.default.removeItem(at: dir) }
 
