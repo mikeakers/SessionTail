@@ -10,11 +10,11 @@ call/result summaries, thinking blocks, token usage, and more.
 
 ## Installation
 
-Requires Swift 6.2+ and macOS 13+.
+Requires Swift 6.2+. Works on macOS 13+ and Linux.
 
 ```bash
-git clone https://github.com/your-user/sessiontail.git
-cd sessiontail
+git clone https://github.com/mikeakers/SessionTail.git
+cd SessionTail
 swift build -c release
 # Binary is at .build/release/SessionTail
 ```
